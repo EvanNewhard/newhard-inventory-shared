@@ -1572,14 +1572,17 @@ function renderPackSizes(){
     psCat.innerHTML='<option value="">All categories</option>'+cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
   }
 
-  let list = Object.values(items);
+  // Exclude skipped items entirely — they're not being tracked, so no box size needed
+  let list = Object.values(items).filter(i=>!i.excluded);
   if(q) list = list.filter(i=>i.name.toLowerCase().includes(q));
   if(catF) list = list.filter(i=>i.category===catF);
   if(unsetOnly) list = list.filter(i=>!i.packSize || i.packSize===1);
   list.sort((a,b)=>a.name.localeCompare(b.name));
 
-  const totalSet = Object.values(items).filter(i=>i.packSize>1).length;
-  const totalUnset = Object.values(items).length - totalSet;
+  // Totals also ignore skipped items
+  const trackedItems = Object.values(items).filter(i=>!i.excluded);
+  const totalSet = trackedItems.filter(i=>i.packSize>1).length;
+  const totalUnset = trackedItems.length - totalSet;
   document.getElementById('ps-totals').innerHTML = `<span><strong>${totalSet}</strong> set</span><span><strong>${totalUnset}</strong> unset (single units)</span>`;
 
   const box = document.getElementById('ps-list');
