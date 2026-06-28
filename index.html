@@ -1612,7 +1612,10 @@ function ingest(wb, rawBase64){
     fromDate: state.prevImport?state.prevImport.date:null, toDate: state.lastImport.date
   } : null;
 
-  scheduleSave(); showDashboard(); buildSummary(); populateCategories(); render();
+  showDashboard(); buildSummary(); populateCategories(); render();
+  // The import is the most important write there is — flush it to the cloud immediately and mark
+  // the mutation window, so a background refresh from another session can't bounce stale counts back.
+  saveNow();
   const newPart = newCount > 0 ? ` · ${newCount} new item${newCount>1?'s':''} added` : '';
   toast(hadPrior ? `Updated · ${Math.round(totalSold)} units sold${newPart}` : `Loaded ${rows.length} items`);
   // Show change report popup if there are interesting changes (only after a non-first upload)
