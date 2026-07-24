@@ -15,7 +15,7 @@ import { getStore } from '@netlify/blobs';
 
 const SITE = 'https://adorable-cajeta-d1c42f.netlify.app';
 const REDIRECT_URI = SITE + '/api/clover/callback';
-const BUILD = 'clover-2026-07-17-fluid'; // bump to verify deploys
+const BUILD = 'clover-2026-07-22-modsales'; // bump to verify deploys
 const APP_ID = () => (process.env.CLOVER_APP_ID||'').trim();
 const APP_SECRET = () => (process.env.CLOVER_APP_SECRET||'').trim();
 
@@ -251,12 +251,27 @@ export default async (req) => {
       const from = parseInt(url.searchParams.get('from')) || 0;
       const to = parseInt(url.searchParams.get('to')) || Date.now();
       const days = {}, totals = {};
+      // Per-MODIFIER sales (e.g. which chip flavor sold). Clover can't hold stock on a modifier, but
+      // it DOES record which modifier was chosen on each sale, so we can count flavors from orders.
+      // Keyed "<itemId>|<modifierName>". Kept separate so the plain item totals are unaffected.
+      const modDays = {}, modTotals = {};
+      let modsAvailable = false;
       let orderCount = 0, offset = 0, limit = 200, guard = 0;
+      // Try the richer query first; if Clover rejects the nested expand, fall back to the original so
+      // the ordinary sales data can never be lost by adding this.
+      let expandStr = 'lineItems,lineItems.modifications';
+      let triedFallback = false;
       while(guard++ < 50){
-        const q = `/v3/merchants/${mId}/orders?expand=lineItems&limit=${limit}&offset=${offset}`
+        const q = `/v3/merchants/${mId}/orders?expand=${encodeURIComponent(expandStr)}&limit=${limit}&offset=${offset}`
           + `&filter=${encodeURIComponent('createdTime>=' + from)}`
           + `&filter=${encodeURIComponent('createdTime<=' + to)}`;
-        const page = await cloverGet(auth, q);
+        let page;
+        try {
+          page = await cloverGet(auth, q);
+        } catch(e){
+          if(!triedFallback){ triedFallback = true; expandStr = 'lineItems'; guard--; continue; }
+          throw e;
+        }
         const els = (page && page.elements) || [];
         for(const o of els){
           orderCount++;
@@ -271,13 +286,70 @@ export default async (req) => {
             days[day] = days[day] || {};
             days[day][iid] = (days[day][iid] || 0) + qty;
             totals[iid] = (totals[iid] || 0) + qty;
+            // Attribute the sale to the chosen modifier, when one is present.
+            const mods = (li.modifications && li.modifications.elements) || [];
+            for(const m of mods){
+              const nm = String(m.name || (m.modifier && m.modifier.name) || '').trim();
+              if(!nm) continue;
+              modsAvailable = true;
+              const key = iid + '|' + nm;
+              modDays[day] = modDays[day] || {};
+              modDays[day][key] = (modDays[day][key] || 0) + qty;
+              modTotals[key] = (modTotals[key] || 0) + qty;
+            }
           }
         }
         if(els.length < limit) break;
         offset += limit;
         await new Promise(r=>setTimeout(r, 80)); // gentle throttle
       }
-      return json({ ok:true, from, to, orderCount, days, totals });
+      return json({ ok:true, from, to, orderCount, days, totals, modDays, modTotals, modsAvailable, expandUsed: expandStr });
+    }
+
+    // ---- MODSALES: prove whether Clover reports WHICH modifier (flavor) sold (diagnostic) ----
+    // GET /api/clover/modsales?days=14  → per-flavor sales counts straight from order history.
+    if(path === 'modsales' && req.method === 'GET'){
+      const auth = await validAuth();
+      if(!auth) return json({ error:'Not connected to Clover.' }, 400);
+      const mId = auth.merchantId;
+      const nDays = Math.max(1, Math.min(60, parseInt(url.searchParams.get('days')) || 14));
+      const to = Date.now(), from = to - nDays*86400000;
+      const found = {};   // "<itemName> – <modifierName>" -> qty
+      let orderCount = 0, lineCount = 0, withMods = 0, offset = 0, guard = 0;
+      let expandStr = 'lineItems,lineItems.modifications', triedFallback = false, note = '';
+      while(guard++ < 25){
+        const q = `/v3/merchants/${mId}/orders?expand=${encodeURIComponent(expandStr)}&limit=200&offset=${offset}`
+          + `&filter=${encodeURIComponent('createdTime>=' + from)}`
+          + `&filter=${encodeURIComponent('createdTime<=' + to)}`;
+        let page;
+        try { page = await cloverGet(auth, q); }
+        catch(e){
+          if(!triedFallback){ triedFallback = true; expandStr = 'lineItems'; note = 'nested expand rejected; fell back to lineItems only'; guard--; continue; }
+          return json({ error: String(e.message||e) }, 502);
+        }
+        const els = (page && page.elements) || [];
+        for(const o of els){
+          orderCount++;
+          for(const li of ((o.lineItems && o.lineItems.elements) || [])){
+            lineCount++;
+            const mods = (li.modifications && li.modifications.elements) || [];
+            if(mods.length) withMods++;
+            let qty = (typeof li.unitQty === 'number' && li.unitQty > 0) ? li.unitQty : 1;
+            for(const m of mods){
+              const nm = String(m.name || (m.modifier && m.modifier.name) || '').trim() || '(unnamed)';
+              const key = (li.name || 'item') + ' – ' + nm;
+              found[key] = (found[key] || 0) + qty;
+            }
+          }
+        }
+        if(els.length < 200) break;
+        offset += 200;
+        await new Promise(r=>setTimeout(r, 80));
+      }
+      const sorted = Object.keys(found).sort((a,b)=>found[b]-found[a]).slice(0,60);
+      return json({ ok:true, build:BUILD, windowDays:nDays, expandUsed:expandStr, note,
+        orderCount, lineItems:lineCount, lineItemsWithModifiers:withMods,
+        perFlavorSales: sorted.map(k=>({ what:k, sold:found[k] })) });
     }
 
     // ---- RAW: inspect exactly what Clover reports for items matching a name (diagnostic) ----
@@ -381,4 +453,3 @@ export default async (req) => {
 };
 
 export const config = { path: '/api/clover/*' };
-
