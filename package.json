@@ -1,0 +1,13 @@
+{
+  "name": "newhard-farms-inventory",
+  "version": "1.0.0",
+  "description": "Newhard Farms shared inventory tracker",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^7.0.0",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1"
+  }
+}
