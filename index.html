@@ -3357,7 +3357,7 @@ function updateStock(id,val){
 // queued delta. Safe when the store is closed (no sales in flight). Returns silently on background runs.
 let cloverDraining=false;
 async function drainCloverQueue(manual){
-  if(typeof syncAllParentStocks==='function') syncAllParentStocks();   // parent total = sum of flavors
+  if(typeof syncAllParentStocks==='function') syncAllParentStocks({silent:true});   // parent total = sum of flavors
   if(cloverDraining) return;
   if(!queueActive()){ if(manual) toast('Connect Clover first to apply the queue.'); return; }
   ensureQueue();
@@ -3416,7 +3416,7 @@ function clearQueueItem(id){ if(state.cloverQueue && state.cloverQueue[id]){ del
 async function clearStuckSync(){
   const q = state.cloverQueue||{};
   const stuck = [];
-  Object.values(items).forEach(it=>{ if(it._dirtyStock && it.id && !String(it.id).startsWith('name:') && q[it.id] && q[it.id].err) stuck.push(it); });
+  Object.values(items).forEach(it=>{ if(it._dirtyStock && it.id && !String(it.id).startsWith('name:') && ((q[it.id] && q[it.id].err) || it._pushErr)) stuck.push(it); });
   Object.keys(q).forEach(id=>{ if(q[id] && q[id].err && !stuck.find(s=>s.id===id) && items[id]) stuck.push(items[id]); });
   // If nothing has a recorded error, fall back to any dirty items (user chose "stop trying").
   if(!stuck.length){
@@ -3429,7 +3429,7 @@ async function clearStuckSync(){
     body:`These keep being rejected by Clover (usually because they aren’t set to “track stock” there):\n\n${names}\n\nThis clears the “waiting to sync” state for them so the banner stops nagging. It does NOT change any stock counts on the website. If you later turn on stock tracking in Clover for these, edit their count once and they’ll sync normally again.`,
     confirmLabel:'Stop trying' });
   if(!ok) return;
-  stuck.forEach(it=>{ delete it._dirtyStock; if(state.cloverQueue && state.cloverQueue[it.id]) delete state.cloverQueue[it.id]; });
+  stuck.forEach(it=>{ delete it._dirtyStock; delete it._pushErr; if(state.cloverQueue && state.cloverQueue[it.id]) delete state.cloverQueue[it.id]; });
   saveNow(); render(); buildSummary(); updateNavCounts(); if(currentPage==='import') renderImport();
   toast(`Cleared ${stuck.length} stuck item${stuck.length>1?'s':''}`);
 }
@@ -3437,7 +3437,7 @@ async function clearStuckSync(){
 // harmless (no double-adding) — this is what makes deliveries safe and repeatable. Shows a progress
 // bar and ONE clear result. Used when a delivery is confirmed while the store is closed.
 async function syncItemsToClover(ids, label){
-  if(typeof syncAllParentStocks==='function') syncAllParentStocks();   // parent total = sum of flavors
+  if(typeof syncAllParentStocks==='function') syncAllParentStocks({silent:true});   // parent total = sum of flavors
   const uniq=[...new Set(ids||[])];
   const pushable=[];
   uniq.forEach(id=>{ const it=items[id]; if(!it) return; if(!it.id||String(it.id).startsWith('name:')) return; pushable.push({id, quantity:Math.max(0,Math.round(it.stock||0)), name:it.name}); });
@@ -3472,7 +3472,7 @@ async function syncItemsToClover(ids, label){
 // Clover in one go, as absolute counts, with one clear result. This is the "press one button and it's
 // all in Clover, guaranteed" action on the Order arrivals page.
 async function syncAllToClover(){
-  if(typeof syncAllParentStocks==='function') syncAllParentStocks();   // parent total = sum of flavors
+  if(typeof syncAllParentStocks==='function') syncAllParentStocks({silent:true});   // parent total = sum of flavors
   if(!queueActive()){ appAlert({icon:'🔌',title:'Clover isn’t connected',body:'Connect Clover using the button at the top of the screen (and make sure automatic sync is on), then try again.'}); return; }
   if(cloverDraining){ toast('Already syncing…'); return; }
   ensureQueue();
@@ -3496,7 +3496,7 @@ async function syncAllToClover(){
     const res=await pushCountsToClover(pushable, (n,t)=>setOcrProgress(n/t*0.95+0.03, `Sending to Clover… ${n} of ${t}`));
     failures=res.failures||[]; anyNet=!!res.anyNetworkError; anySucc=!!res.anySuccess;
     const failSet=new Set(failures.map(f=>f.id));
-    pushable.forEach(u=>{ if(!failSet.has(u.id) && items[u.id]){ items[u.id].stock=u.quantity; delete items[u.id]._dirtyStock; if(state.cloverQueue[u.id]) delete state.cloverQueue[u.id]; } });
+    pushable.forEach(u=>{ if(!failSet.has(u.id) && items[u.id]){ items[u.id].stock=u.quantity; delete items[u.id]._dirtyStock; delete items[u.id]._pushErr; if(state.cloverQueue[u.id]) delete state.cloverQueue[u.id]; } });
     failures.forEach(f=>{ if(state.cloverQueue[f.id]) state.cloverQueue[f.id].err=f.error||'Clover rejected the update'; });
     saveNow();
   }catch(e){
@@ -4373,7 +4373,15 @@ async function pushCountsToClover(toPush, onProgress){
           settled=true; break;
         }
         done += d.done||0; anySuccess=true;
-        (d.results||[]).forEach(x=>{ if(x.ok){ if(items[x.id]) delete items[x.id]._dirtyStock; } else failures.push(x); });
+        (d.results||[]).forEach(x=>{
+          if(x.ok){ if(items[x.id]){ delete items[x.id]._dirtyStock; delete items[x.id]._pushErr; } }
+          else {
+            failures.push(x);
+            // Remember WHY, on the item itself. Items that are only flagged dirty (no queued delta) had
+            // nowhere to record this, so they showed up as a mystery "1 change waiting" forever.
+            if(items[x.id]) items[x.id]._pushErr = x.error || 'Clover rejected the update';
+          }
+        });
         settled=true;
       }catch(e){ lastErr = String(e.message||e); await sleep(700*(attempt+1)); }
     }
@@ -4385,9 +4393,16 @@ async function pushCountsToClover(toPush, onProgress){
 function collectPushable(changedOnly){
   // Make sure every modifier parent's total equals the sum of its flavors before we send anything, so
   // Clover always receives the correct combined number (flavors themselves are never sent).
-  if(typeof syncAllParentStocks==='function') syncAllParentStocks();
-  return Object.values(items).filter(it=>!it.removed && it.tracked && it.id && !String(it.id).startsWith('name:') && (!changedOnly || it._dirtyStock))
-    .map(it=>({ id:it.id, quantity: Math.max(0, Math.round(it.stock)), name: it.name }));
+  if(typeof syncAllParentStocks==='function') syncAllParentStocks({silent:true});
+  return Object.values(items).filter(it=>{
+    if(it.removed || !it.id || String(it.id).startsWith('name:')) return false;
+    // A pending local change must reach Clover even if the item was never marked "tracked" here — a
+    // hidden modifier parent is the case that matters, and refusing to send it is what left its
+    // "waiting to sync" flag with no way to ever clear. The push turns stock tracking on in Clover
+    // anyway. Full pushes (changedOnly=false) still only touch tracked items.
+    if(changedOnly) return !!it._dirtyStock;
+    return !!it.tracked;
+  }).map(it=>({ id:it.id, quantity: Math.max(0, Math.round(it.stock||0)), name: it.name }));
 }
 // Immediate, targeted push of just-changed items (used right after a delivery) — not held by store hours.
 async function pushChangedNow(){
@@ -4954,19 +4969,38 @@ function flavorStockTotal(pid){
 }
 // Recompute the parent's stock from its flavors. Only when flavor mode is on for that parent, so a
 // half-configured modifier can never zero out a real Clover count.
-function syncParentStock(pid){
+//
+// opts.silent — update the number WITHOUT flagging it to be pushed to Clover. Use this whenever the
+// flavor counts moved because of something Clover already knows about (a real sale it rang up, or a
+// plain re-derivation on load / before a push). Clover decrements the parent itself on every sale, so
+// writing the recomputed sum back would be redundant at best and could overwrite a newer Clover count.
+// Flagging it anyway is what left the parent permanently "waiting to sync": nothing in the sales path
+// schedules a push, so the flag sat there forever and the Order arrivals banner never went green.
+// Default is NOT silent — a genuine local change (a delivery, a hand edit) must still reach Clover.
+function syncParentStock(pid, opts){
   if(!flavorMode(pid)) return false;
   const it=items[pid]; if(!it) return false;
   const total=flavorStockTotal(pid);
   if(Math.round(Number(it.stock)||0) !== total){
     it.prevStock = it.stock;
     it.stock = total;
-    it._dirtyStock = true;      // so it gets pushed to Clover as the combined total
+    if(!(opts && opts.silent)){
+      it._dirtyStock = true;    // so it gets pushed to Clover as the combined total
+      // ...and make sure something actually pushes it, instead of leaving the flag to sit until some
+      // unrelated change happens to trigger a push. Same split as a normal stock edit: connected =>
+      // the debounced auto-push sends it (and clears the flags on success); offline => flag the website
+      // as diverged from Clover so the yellow banner tells whoever's here to sync when they're back.
+      if(typeof autoSyncOn==='function' && autoSyncOn()){
+        if(typeof scheduleAutoPush==='function') scheduleAutoPush();
+      } else if(typeof markUnsynced==='function'){
+        markUnsynced('flavor count change');
+      }
+    }
     return true;
   }
   return false;
 }
-function syncAllParentStocks(){ let n=0; Object.keys(state.modifiers||{}).forEach(pid=>{ if(syncParentStock(pid)) n++; }); return n; }
+function syncAllParentStocks(opts){ let n=0; Object.keys(state.modifiers||{}).forEach(pid=>{ if(syncParentStock(pid, opts)) n++; }); return n; }
 // Turn per-flavor tracking on/off. Enabling SPLITS the parent's current count across the flavors so
 // the total is preserved exactly — enabling it never changes what Clover sees.
 function setFlavorMode(pid, on){
@@ -5051,7 +5085,9 @@ function applyFlavorSales(){
       cand.f.stock=Math.round(Number(cand.f.stock)||0)-1; remaining--; touched++;
     }
   });
-  if(touched) syncAllParentStocks();
+  // Silent: these deductions mirror sales Clover already rang up (it decremented the parent itself),
+  // so the recomputed total must NOT be flagged for pushing back to Clover.
+  if(touched) syncAllParentStocks({silent:true});
   return touched;
 }
 // A delivery of a specific flavor lands on that flavor, then rolls up into the parent's total.
@@ -7413,7 +7449,7 @@ function renderImport(){
       const dirtyItems = Object.values(items).filter(it=>it._dirtyStock && it.id && !String(it.id).startsWith('name:'));
       const q = state.cloverQueue||{};
       const stuck = [];
-      dirtyItems.forEach(it=>{ const e=q[it.id] && q[it.id].err; if(e) stuck.push({name:it.name, err:e}); });
+      dirtyItems.forEach(it=>{ const e=(q[it.id] && q[it.id].err) || it._pushErr; if(e) stuck.push({name:it.name, err:e}); });
       Object.keys(q).forEach(id=>{ if(q[id] && q[id].err && !dirtyItems.find(d=>d.id===id)) stuck.push({name:(items[id]?items[id].name:id), err:q[id].err}); });
       // Items waiting with no error recorded yet (e.g. haven't tried to sync since load) — name them
       // too, so the count is never a total mystery.
@@ -8894,7 +8930,7 @@ async function commitPdfConfirm(){
 // Build a .xlsx file that exactly matches the Clover inventory export format
 async function downloadCloverFile(pid){
   // Combined totals first: each modifier parent's Quantity in the file is the SUM of its flavors.
-  if(typeof syncAllParentStocks==='function') syncAllParentStocks();
+  if(typeof syncAllParentStocks==='function') syncAllParentStocks({silent:true});
   // Make sure we're working with the freshest possible data before generating the file:
   // 1) flush any pending local save (e.g. an arrival you just confirmed a moment ago)
   // 2) pull the latest from the cloud (in case your dad changed something on his device)
@@ -9411,7 +9447,7 @@ async function startApp(){
         showDashboard(); buildSummary(); populateCategories(); render();
         checkDiscardAutoReset();
         if(typeof rollupSalesToSeasonal==='function') rollupSalesToSeasonal();
-        if(typeof applyFlavorSales==='function'){ applyFlavorSales(); syncAllParentStocks(); }
+        if(typeof applyFlavorSales==='function'){ applyFlavorSales(); syncAllParentStocks({silent:true}); }
         setSync('error'); startOutbox(); saveToCloud();
         return;
       } else {
@@ -9426,7 +9462,7 @@ async function startApp(){
     showLoadError();
     return;
   }
-  if(has){ try{ localStorage.setItem('nf_hasdata','1'); }catch(e){} showDashboard(); buildSummary(); populateCategories(); render(); checkDiscardAutoReset(); if(typeof rollupSalesToSeasonal==='function') rollupSalesToSeasonal(); if(typeof applyFlavorSales==='function'){ applyFlavorSales(); syncAllParentStocks(); } }
+  if(has){ try{ localStorage.setItem('nf_hasdata','1'); }catch(e){} showDashboard(); buildSummary(); populateCategories(); render(); checkDiscardAutoReset(); if(typeof rollupSalesToSeasonal==='function') rollupSalesToSeasonal(); if(typeof applyFlavorSales==='function'){ applyFlavorSales(); syncAllParentStocks({silent:true}); } }
   else { showEmpty(); }
   // If Clover is connected, the site keeps itself current automatically — skip the "upload an
   // export" prompt and just pull. Only prompt for a manual export when Clover ISN'T connected.
