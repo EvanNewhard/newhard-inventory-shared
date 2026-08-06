@@ -1548,6 +1548,7 @@ html[data-theme="dark"] input,html[data-theme="dark"] select,html[data-theme="da
   <div class="modal-box wide">
     <div class="modal-header"><span class="modal-title" id="recv-title">Received order</span><button class="modal-close" onclick="closeReceivedOrder()">✕</button></div>
     <div class="modal-sub" id="recv-sub"></div>
+    <input class="search-input" id="recv-search" type="search" placeholder="Search items in this order..." oninput="renderReceivedRows()" style="width:100%;margin-bottom:.75rem" />
     <div id="recv-rows" style="margin-bottom:1rem"></div>
     <div class="modal-actions">
       <button class="btn btn-primary" onclick="copyReceivedToOrderList()">↻ Copy to order list</button>
@@ -7657,8 +7658,23 @@ function openReceivedOrder(pid){
   document.getElementById('recv-title').textContent = p.orderName ? `Received — ${p.orderName}` : 'Received order';
   const recvDate = p.receivedDate ? new Date(p.receivedDate).toLocaleDateString() : '';
   document.getElementById('recv-sub').textContent = `Received ${recvDate}. You can undo this order (reverses the stock that was added) or copy it to your current order list to reorder.`;
+  const search = document.getElementById('recv-search');
+  if(search) search.value = '';
+  renderReceivedRows();
+  document.getElementById('received-modal').style.display='flex';
+}
+function renderReceivedRows(){
+  const p = (state.pendingArrivals||[]).find(x=>x.id===recvTarget);
+  if(!p) return;
+  const searchEl = document.getElementById('recv-search');
+  const q = searchEl ? searchEl.value.toLowerCase().trim() : '';
   const lines = (p.actualLines || p.lines);
-  document.getElementById('recv-rows').innerHTML = lines.map(l=>{
+  const shown = lines.filter(l=> !q || (l.name||'').toLowerCase().includes(q));
+  if(!shown.length){
+    document.getElementById('recv-rows').innerHTML = `<div style="padding:18px;text-align:center;color:var(--text-muted);font-size:14px">No items in this order match “${esc(searchEl.value.trim())}”.</div>`;
+    return;
+  }
+  document.getElementById('recv-rows').innerHTML = shown.map(l=>{
     const got = l.actualUnits!=null ? l.actualUnits : l.units;
     const note = (l.received===false) ? '<span style="color:var(--red)">did not come</span>'
       : (l.actualUnits!=null && l.actualUnits!==l.units) ? `<span style="color:var(--amber-text)">got ${got} of ${l.units}</span>`
@@ -7668,7 +7684,6 @@ function openReceivedOrder(pid){
       <div class="total-units">${note}</div>
     </div>`;
   }).join('');
-  document.getElementById('received-modal').style.display='flex';
 }
 function closeReceivedOrder(){ document.getElementById('received-modal').style.display='none'; recvTarget=null; }
 async function undoReceivedOrder(){
